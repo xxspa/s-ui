@@ -31,3 +31,4 @@ windows/sui-*.exe
 # Editor directories and files
 .idea
 .vscode
+tools/singbox-sub/dist/
