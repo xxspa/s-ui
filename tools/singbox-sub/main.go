@@ -1,10 +1,10 @@
 // singbox-sub: 从 sing-box 配置文件生成订阅文件
 //
-// 用法（生成指定用户）:
+// 用法（指定用户）:
 //
 //	singbox-sub --config config.json --host example.com --user alice --out /var/www/alice.txt
 //
-// 用法（生成所有用户，每人一个文件，文件名=用户名）:
+// 用法（所有用户，每人一个文件）:
 //
 //	singbox-sub --config config.json --host example.com --out-dir /var/www/sub/
 //
@@ -21,6 +21,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	"slices"
+
+	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/util"
 )
 
@@ -29,10 +32,10 @@ func main() {
 	var noBase64 bool
 	flag.StringVar(&configPath, "config", "", "sing-box 配置文件路径（必填）")
 	flag.StringVar(&host, "host", "", "订阅链接使用的公网主机名（必填）")
-	flag.StringVar(&user, "user", "", "用户名（对应 users[].name），空则输出所有用户")
+	flag.StringVar(&user, "user", "", "用户名（users[].name），空则输出所有用户")
 	flag.StringVar(&outFile, "out", "", "输出文件路径（与 --out-dir 二选一）")
-	flag.StringVar(&outDir, "out-dir", "", "输出目录，按用户名分别生成文件（与 --out 二选一）")
-	flag.BoolVar(&noBase64, "no-base64", false, "输出明文链接，不做 base64 编码")
+	flag.StringVar(&outDir, "out-dir", "", "输出目录，按用户名生成文件（与 --out 二选一）")
+	flag.BoolVar(&noBase64, "no-base64", false, "输出明文，不做 base64 编码")
 	flag.Parse()
 
 	if configPath == "" || host == "" {
@@ -99,12 +102,6 @@ func loadConfig(path string) (*singBoxConfig, error) {
 	return &cfg, json.Unmarshal(data, &cfg)
 }
 
-var supportedProto = map[string]bool{
-	"vless": true, "vmess": true, "trojan": true,
-	"shadowsocks": true, "hysteria2": true, "tuic": true,
-	"socks": true, "http": true, "mixed": true,
-}
-
 func collectLinks(cfg *singBoxConfig, host, identifier string) []string {
 	var all []string
 	for _, raw := range cfg.Inbounds {
@@ -124,302 +121,153 @@ func collectByUser(cfg *singBoxConfig, host string) map[string][]string {
 		if json.Unmarshal(raw, &inbound) != nil {
 			continue
 		}
-		if !supportedProto[getString(inbound, "type")] {
-			continue
-		}
-		tag := getString(inbound, "tag")
-		port := int(getFloat(inbound, "listen_port"))
-		tls := normalizeTLS(inbound)
-		for _, u := range getUsers(inbound) {
-			name := getString(u, "name")
-			remark := tag
-			if name != "" {
-				remark = tag + "-" + name
-			}
-			links := genLinks(inbound, u, tls, host, port, remark)
+		for _, user := range getUsers(inbound) {
+			name, _ := user["name"].(string)
+			links := linksFromInbound(inbound, host, name)
 			result[name] = append(result[name], links...)
 		}
 	}
 	return result
 }
 
-func linksFromInbound(inbound map[string]interface{}, host, identifier string) []string {
-	if !supportedProto[getString(inbound, "type")] {
+// ---------- 核心：加载进内存后直接复用 util.LinkGenerator ----------
+
+func linksFromInbound(raw map[string]interface{}, host, identifier string) []string {
+	proto, _ := raw["type"].(string)
+	if !slices.Contains(util.InboundTypeWithLink, proto) {
 		return nil
 	}
-	tag := getString(inbound, "tag")
-	port := int(getFloat(inbound, "listen_port"))
-	tls := normalizeTLS(inbound)
+
+	base := buildInbound(raw)
 
 	var links []string
-	for _, u := range getUsers(inbound) {
-		if identifier != "" && !matchUser(u, identifier) {
+	for _, user := range getUsers(raw) {
+		if identifier != "" && !matchUser(user, identifier) {
 			continue
 		}
-		name := getString(u, "name")
-		remark := tag
-		if name != "" {
-			remark = tag + "-" + name
+		// 每个用户独立一份 inbound，Tag 带上用户名作为备注
+		inbound := *base
+		if name, _ := user["name"].(string); name != "" {
+			inbound.Tag = base.Tag + "-" + name
 		}
-		links = append(links, genLinks(inbound, u, tls, host, port, remark)...)
+		clientCfg, _ := json.Marshal(buildClientConfig(proto, user, raw))
+		links = append(links, util.LinkGenerator(clientCfg, &inbound, host)...)
 	}
 	return links
 }
 
-// ---------- 链接生成：复用 util 包的 GetTransportParams / GetTlsParams / AddParams ----------
-
-// buildAddr 构造单条地址记录，格式与 util.genLink 内部的 addrs 元素兼容。
-func buildAddr(host string, port int, remark string, tls map[string]interface{}) map[string]interface{} {
-	addr := map[string]interface{}{
-		"server":      host,
-		"server_port": float64(port),
-		"remark":      remark,
+// buildInbound 把 sing-box 原始 inbound JSON 组装成 model.Inbound
+// Options 存放 LinkGenerator 需要的协议字段（transport、listen_port、obfs 等）
+func buildInbound(raw map[string]interface{}) *model.Inbound {
+	inbound := &model.Inbound{
+		Type:    raw["type"].(string),
+		Tag:     raw["tag"].(string),
+		Addrs:   json.RawMessage("null"), // 空则 LinkGenerator 用 hostname 自动填充
+		OutJson: json.RawMessage("{}"),   // hysteria2/tuic 会访问此字段
 	}
-	if tls != nil {
-		addr["tls"] = tls
-	}
-	return addr
-}
 
-func genLinks(inbound map[string]interface{}, user, tls map[string]interface{}, host string, port int, remark string) []string {
-	proto := getString(inbound, "type")
-	addr := buildAddr(host, port, remark, tls)
-
-	// transport params：复用 util.GetTransportParams
-	transportParams := util.GetTransportParams(inbound["transport"])
-
-	switch proto {
-	case "vless":
-		return vlessLinks(user, inbound, tls, transportParams, addr, remark)
-	case "vmess":
-		return vmessLinks(user, inbound, tls, transportParams, addr, remark)
-	case "trojan":
-		return trojanLinks(user, tls, transportParams, addr, remark)
-	case "shadowsocks":
-		return shadowsocksLinks(user, inbound, host, port, remark)
-	case "hysteria2":
-		return hysteria2Links(user, inbound, tls, host, port, remark)
-	case "tuic":
-		return tuicLinks(user, inbound, tls, host, port, remark)
-	case "socks":
-		return socksLinks(user, host, port)
-	case "http", "mixed":
-		return httpLinks(user, tls, host, port)
-	}
-	return nil
-}
-
-func vlessLinks(user, inbound map[string]interface{}, tls map[string]interface{}, transportParams []util.LinkParam, addr map[string]interface{}, remark string) []string {
-	uuid := getString(user, "uuid")
-	if uuid == "" {
-		return nil
-	}
-	params := make([]util.LinkParam, len(transportParams))
-	copy(params, transportParams)
-	if tls != nil {
-		util.GetTlsParams(&params, tls, "allowInsecure")
-		// flow 仅在 TCP 传输（无 transport 字段）时生效
-		tr, _ := inbound["transport"].(map[string]interface{})
-		if flow := getString(user, "flow"); flow != "" && getString(tr, "type") == "" {
-			params = append(params, util.LinkParam{Key: "flow", Value: flow})
+	if tlsRaw, ok := raw["tls"].(map[string]interface{}); ok {
+		if enabled, _ := tlsRaw["enabled"].(bool); enabled {
+			inbound.TlsId = 1
+			inbound.Tls = buildModelTls(tlsRaw)
 		}
 	}
-	uri := fmt.Sprintf("vless://%s@%s:%.0f", uuid, addr["server"], addr["server_port"])
-	return []string{util.AddParams(uri, params, remark)}
+
+	// Options = 原始 JSON 去掉已单独处理的字段
+	opts := cloneMap(raw)
+	for _, k := range []string{"type", "tag", "tls", "users", "clients", "addrs", "out_json", "id"} {
+		delete(opts, k)
+	}
+	inbound.Options, _ = json.Marshal(opts)
+
+	return inbound
 }
 
-func vmessLinks(user, inbound map[string]interface{}, tls map[string]interface{}, transportParams []util.LinkParam, addr map[string]interface{}, remark string) []string {
-	uuid := getString(user, "uuid")
-	if uuid == "" {
-		return nil
+// buildModelTls 把 sing-box 服务端 tls 配置拆成 model.Tls{Server, Client}
+// prepareTls（genLink.go 内部）会把两者合并后生成客户端链接参数
+func buildModelTls(tlsRaw map[string]interface{}) *model.Tls {
+	// Server：prepareTls 从中读取 enabled / server_name / alpn / reality.short_id[]
+	serverTls := map[string]interface{}{
+		"enabled":     tlsRaw["enabled"],
+		"server_name": tlsRaw["server_name"],
 	}
-	obj := map[string]interface{}{
-		"v":    "2",
-		"ps":   remark,
-		"add":  addr["server"],
-		"port": fmt.Sprintf("%.0f", addr["server_port"]),
-		"id":   uuid,
-		"aid":  "0",
+	if alpn, ok := tlsRaw["alpn"]; ok {
+		serverTls["alpn"] = alpn
 	}
-	// transport params → vmess 字段映射
-	net, typ, host, path := "tcp", "", "", ""
-	for _, p := range transportParams {
-		switch p.Key {
-		case "type":
-			net = p.Value
-		case "host":
-			host = p.Value
-		case "path":
-			path = p.Value
-		}
+
+	// Client：prepareTls 以此为基础，再叠加 Server 的字段
+	// 不含 utls，避免生成空的 fp= 参数（服务端配置中无客户端指纹信息）
+	clientTls := map[string]interface{}{
+		"enabled":  false,
+		"insecure": false,
 	}
-	if net == "http" {
-		obj["net"] = "tcp"
-		typ = "http"
-	} else {
-		obj["net"] = net
-	}
-	if typ != "" {
-		obj["type"] = typ
-	}
-	if host != "" {
-		obj["host"] = host
-	}
-	if path != "" {
-		obj["path"] = path
-	}
-	// tls 部分：复用 GetTlsParams 解析后再映射到 vmess 字段
-	if tls != nil {
-		var tlsLinkParams []util.LinkParam
-		util.GetTlsParams(&tlsLinkParams, tls, "allowInsecure")
-		obj["tls"] = "tls"
-		for _, p := range tlsLinkParams {
-			switch p.Key {
-			case "sni":
-				obj["sni"] = p.Value
-			case "fp":
-				obj["fp"] = p.Value
-			case "alpn":
-				obj["alpn"] = p.Value
+
+	if reality, ok := tlsRaw["reality"].(map[string]interface{}); ok {
+		if enabled, _ := reality["enabled"].(bool); enabled {
+			// Server 侧只保留 enabled 和 short_id 数组（prepareTls 会随机取一个）
+			serverTls["reality"] = map[string]interface{}{
+				"enabled":  true,
+				"short_id": reality["short_id"],
+			}
+			// Client 侧需要 public_key（从 private_key 推导）
+			pubKey, _ := reality["public_key"].(string)
+			if pubKey == "" {
+				privKey, _ := reality["private_key"].(string)
+				pubKey = derivePublicKey(privKey)
+			}
+			clientTls["reality"] = map[string]interface{}{
+				"enabled":    true,
+				"public_key": pubKey,
+				"short_id":   "", // 由 prepareTls 从 Server 的数组里取
 			}
 		}
-	} else {
-		obj["tls"] = "none"
 	}
-	b, _ := json.Marshal(obj)
-	return []string{"vmess://" + util.ToBase64(b)}
+
+	serverJSON, _ := json.Marshal(serverTls)
+	clientJSON, _ := json.Marshal(clientTls)
+	return &model.Tls{
+		Server: json.RawMessage(serverJSON),
+		Client: json.RawMessage(clientJSON),
+	}
 }
 
-func trojanLinks(user map[string]interface{}, tls map[string]interface{}, transportParams []util.LinkParam, addr map[string]interface{}, remark string) []string {
-	password := getString(user, "password")
-	if password == "" {
-		return nil
-	}
-	params := make([]util.LinkParam, len(transportParams))
-	copy(params, transportParams)
-	if tls != nil {
-		util.GetTlsParams(&params, tls, "allowInsecure")
-	}
-	uri := fmt.Sprintf("trojan://%s@%s:%.0f", password, addr["server"], addr["server_port"])
-	return []string{util.AddParams(uri, params, remark)}
-}
-
-func shadowsocksLinks(user, inbound map[string]interface{}, host string, port int, remark string) []string {
-	method := getString(inbound, "method")
-	var password string
-	if strings.HasPrefix(method, "2022") {
-		password = getString(inbound, "password") + ":" + getString(user, "password")
-	} else {
-		password = getString(user, "password")
-		if password == "" {
-			password = getString(inbound, "password")
+// buildClientConfig 把 sing-box users[] 中的单个用户转成 util.LinkGenerator 期望的格式：
+// map[协议名]map[字段]值，例如 {"vless": {"uuid": "...", "flow": "..."}}
+func buildClientConfig(proto string, user, inbound map[string]interface{}) map[string]map[string]interface{} {
+	cfg := map[string]map[string]interface{}{}
+	switch proto {
+	case "vless":
+		cfg["vless"] = pick(user, "uuid", "flow")
+	case "vmess":
+		cfg["vmess"] = pick(user, "uuid")
+	case "trojan":
+		cfg["trojan"] = pick(user, "password")
+	case "shadowsocks":
+		key := "shadowsocks"
+		if method, _ := inbound["method"].(string); method == "2022-blake3-aes-128-gcm" {
+			key = "shadowsocks16"
 		}
+		cfg[key] = pick(user, "password")
+	case "naive":
+		cfg["naive"] = pick(user, "username", "password")
+	case "hysteria":
+		cfg["hysteria"] = map[string]interface{}{"auth_str": user["password"]}
+	case "hysteria2":
+		cfg["hysteria2"] = pick(user, "password")
+	case "tuic":
+		cfg["tuic"] = pick(user, "uuid", "password")
+	case "anytls":
+		cfg["anytls"] = pick(user, "password")
+	case "socks", "mixed":
+		cfg["socks"] = pick(user, "username", "password")
+		cfg["http"] = cfg["socks"]
+	case "http":
+		cfg["http"] = pick(user, "username", "password")
 	}
-	if method == "" || password == "" {
-		return nil
-	}
-	encoded := util.ToBase64([]byte(method + ":" + password))
-	return []string{fmt.Sprintf("ss://%s@%s:%d#%s", encoded, host, port, remark)}
+	return cfg
 }
 
-func hysteria2Links(user, inbound map[string]interface{}, tls map[string]interface{}, host string, port int, remark string) []string {
-	password := getString(user, "password")
-	if password == "" {
-		return nil
-	}
-	var params []util.LinkParam
-	if tls != nil {
-		util.GetTlsParams(&params, tls, "insecure")
-	}
-	if obfs, ok := inbound["obfs"].(map[string]interface{}); ok {
-		if t := getString(obfs, "type"); t != "" {
-			params = append(params, util.LinkParam{Key: "obfs", Value: t})
-		}
-		if p := getString(obfs, "password"); p != "" {
-			params = append(params, util.LinkParam{Key: "obfs-password", Value: p})
-		}
-	}
-	uri := fmt.Sprintf("hysteria2://%s@%s:%d", password, host, port)
-	return []string{util.AddParams(uri, params, remark)}
-}
-
-func tuicLinks(user, inbound map[string]interface{}, tls map[string]interface{}, host string, port int, remark string) []string {
-	uuid, password := getString(user, "uuid"), getString(user, "password")
-	if uuid == "" || password == "" {
-		return nil
-	}
-	var params []util.LinkParam
-	if tls != nil {
-		util.GetTlsParams(&params, tls, "insecure")
-	}
-	if cc := getString(inbound, "congestion_control"); cc != "" {
-		params = append(params, util.LinkParam{Key: "congestion_control", Value: cc})
-	}
-	uri := fmt.Sprintf("tuic://%s:%s@%s:%d", uuid, password, host, port)
-	return []string{util.AddParams(uri, params, remark)}
-}
-
-func socksLinks(user map[string]interface{}, host string, port int) []string {
-	u, p := getString(user, "username"), getString(user, "password")
-	if u != "" && p != "" {
-		return []string{fmt.Sprintf("socks5://%s:%s@%s:%d", u, p, host, port)}
-	}
-	return []string{fmt.Sprintf("socks5://%s:%d", host, port)}
-}
-
-func httpLinks(user map[string]interface{}, tls map[string]interface{}, host string, port int) []string {
-	scheme := "http"
-	if tls != nil {
-		scheme = "https"
-	}
-	u, p := getString(user, "username"), getString(user, "password")
-	if u != "" && p != "" {
-		return []string{fmt.Sprintf("%s://%s:%s@%s:%d", scheme, u, p, host, port)}
-	}
-	return []string{fmt.Sprintf("%s://%s:%d", scheme, host, port)}
-}
-
-// ---------- TLS 规格化：sing-box 服务端配置 → GetTlsParams 期望的格式 ----------
-
-// normalizeTLS 把 sing-box 服务端 tls 字段转换成 util.GetTlsParams 能直接消费的格式：
-//   - Reality: private_key → public_key（X25519 推导），short_id[] → short_id（取第一个）
-//   - 标准 TLS: 字段名兼容，直接透传
-func normalizeTLS(inbound map[string]interface{}) map[string]interface{} {
-	raw, ok := inbound["tls"].(map[string]interface{})
-	if !ok || !getBool(raw, "enabled") {
-		return nil
-	}
-
-	tls := map[string]interface{}{
-		"enabled":     true,
-		"server_name": getString(raw, "server_name"),
-		"insecure":    getBool(raw, "insecure"),
-	}
-	if alpn, ok := raw["alpn"]; ok {
-		tls["alpn"] = alpn
-	}
-	if utls, ok := raw["utls"]; ok {
-		tls["utls"] = utls
-	}
-
-	if reality, ok := raw["reality"].(map[string]interface{}); ok && getBool(reality, "enabled") {
-		pubKey := getString(reality, "public_key")
-		if pubKey == "" {
-			pubKey = derivePublicKey(getString(reality, "private_key"))
-		}
-		shortID := ""
-		if sids, ok := reality["short_id"].([]interface{}); ok && len(sids) > 0 {
-			shortID, _ = sids[0].(string)
-		}
-		tls["reality"] = map[string]interface{}{
-			"enabled":    true,
-			"public_key": pubKey,
-			"short_id":   shortID,
-		}
-	}
-
-	return tls
-}
+// ---------- 辅助函数 ----------
 
 // derivePublicKey 从 X25519 私钥（base64url 无填充）推导公钥
 func derivePublicKey(privB64 string) string {
@@ -437,27 +285,23 @@ func derivePublicKey(privB64 string) string {
 	return base64.RawURLEncoding.EncodeToString(priv.PublicKey().Bytes())
 }
 
-// ---------- 辅助函数 ----------
-
 func getUsers(inbound map[string]interface{}) []map[string]interface{} {
 	for _, field := range []string{"users", "clients"} {
-		raw, ok := inbound[field].([]interface{})
-		if !ok {
-			continue
-		}
-		var users []map[string]interface{}
-		for _, u := range raw {
-			if m, ok := u.(map[string]interface{}); ok {
-				users = append(users, m)
+		if raw, ok := inbound[field].([]interface{}); ok {
+			var users []map[string]interface{}
+			for _, u := range raw {
+				if m, ok := u.(map[string]interface{}); ok {
+					users = append(users, m)
+				}
 			}
-		}
-		if len(users) > 0 {
-			return users
+			if len(users) > 0 {
+				return users
+			}
 		}
 	}
 	// shadowsocks 单用户模式
-	if method := getString(inbound, "method"); method != "" {
-		if pass := getString(inbound, "password"); pass != "" {
+	if method, _ := inbound["method"].(string); method != "" {
+		if pass, _ := inbound["password"].(string); pass != "" {
 			return []map[string]interface{}{{"password": pass, "name": ""}}
 		}
 	}
@@ -466,24 +310,27 @@ func getUsers(inbound map[string]interface{}) []map[string]interface{} {
 
 func matchUser(user map[string]interface{}, id string) bool {
 	for _, field := range []string{"name", "uuid", "username", "password"} {
-		if getString(user, field) == id {
+		if v, _ := user[field].(string); v == id {
 			return true
 		}
 	}
 	return false
 }
 
-func getString(m map[string]interface{}, key string) string {
-	v, _ := m[key].(string)
-	return v
+// pick 从 src 中提取指定 key，返回新 map
+func pick(src map[string]interface{}, keys ...string) map[string]interface{} {
+	m := map[string]interface{}{}
+	for _, k := range keys {
+		if v, ok := src[k]; ok {
+			m[k] = v
+		}
+	}
+	return m
 }
 
-func getBool(m map[string]interface{}, key string) bool {
-	v, _ := m[key].(bool)
-	return v
-}
-
-func getFloat(m map[string]interface{}, key string) float64 {
-	v, _ := m[key].(float64)
-	return v
+func cloneMap(m map[string]interface{}) map[string]interface{} {
+	b, _ := json.Marshal(m)
+	var result map[string]interface{}
+	json.Unmarshal(b, &result)
+	return result
 }

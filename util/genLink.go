@@ -592,14 +592,6 @@ func getTransportParams(t interface{}) []LinkParam {
 	return params
 }
 
-// GetTransportParams 和 GetTlsParams、AddParams、ToBase64 是供外部包复用的导出版本。
-func GetTransportParams(t interface{}) []LinkParam    { return getTransportParams(t) }
-func AddParams(uri string, params []LinkParam, remark string) string { return addParams(uri, params, remark) }
-func ToBase64(d []byte) string                        { return toBase64(d) }
-func GetTlsParams(params *[]LinkParam, tls map[string]interface{}, insecureKey string) {
-	getTlsParams(params, tls, insecureKey)
-}
-
 func getTlsParams(params *[]LinkParam, tls map[string]interface{}, insecureKey string) {
 	if reality, ok := tls["reality"].(map[string]interface{}); ok && reality["enabled"].(bool) {
 		*params = append(*params, LinkParam{"security", "reality"})
