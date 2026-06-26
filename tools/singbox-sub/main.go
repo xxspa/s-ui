@@ -55,7 +55,7 @@ func main() {
 			if name == "" {
 				continue
 			}
-			path := filepath.Join(outDir, name+".txt")
+			path := filepath.Join(outDir, name)
 			if err := writeLinks(path, links, noBase64); err != nil {
 				fmt.Fprintf(os.Stderr, "写入 %s 失败: %v\n", name, err)
 			} else {
