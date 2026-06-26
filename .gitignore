@@ -32,3 +32,4 @@ windows/sui-*.exe
 .idea
 .vscode
 tools/singbox-sub/dist/
+singbox-sub-*
